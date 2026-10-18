@@ -1,0 +1,340 @@
+# =============================================================================
+# docker-compose.yml — the whole system, on one command.
+#
+#   docker compose up -d --build
+#
+# ANSWERING "DO WE RUN THE DATABASE IN DOCKER, OR USE SQLITE?"
+#
+# WE RUN REAL POSTGRES AND REAL REDIS IN DOCKER. The reasoning matters:
+#
+#   SQLite CANNOT demonstrate the things this project is about. It has no
+#   SELECT ... FOR UPDATE, no SKIP LOCKED, no advisory locks, and it serialises
+#   writes with a single database-level lock. Every concurrency behaviour we
+#   built would be either absent or faked. A locking demonstration on SQLite
+#   demonstrates nothing.
+#
+#   A LOCALLY-INSTALLED POSTGRES works, but "install Postgres 16, create a
+#   user, create a database, set a password" is four steps that differ on every
+#   machine and go stale. Docker makes it one command and identical everywhere.
+#
+#   DOCKER COSTS: a running daemon, ~400MB of images, and a slower first start.
+#   For a system whose entire point is multi-service behaviour under
+#   concurrency, that is a bargain.
+#
+# WE ALSO KEEP A NO-DOCKER PATH (`make run-nodocker`, POSTGRES_ENABLED=false),
+# because being able to read and run the code with nothing installed is
+# genuinely valuable. It swaps in the in-memory repository and the in-process
+# LRU cache. What you LOSE is explicit: durability, real row locks, and
+# cross-replica cache coherence. That honesty is the point of having both.
+# =============================================================================
+
+name: order-processing-system
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — the source of truth
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ops-postgres
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: orders
+      # Initialise with C collation for deterministic, faster text sorting.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    ports:
+      # Exposed so you can psql in and look at the data yourself — which you
+      # should, because seeing the version column increment is more convincing
+      # than reading about it.
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Creates the SECOND database used by the integration tests, so the test
+      # suite never touches the data you are demoing with.
+      - ./deploy/postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    command:
+      - postgres
+      # max_connections must exceed (replicas x POSTGRES_MAX_CONNS) plus
+      # headroom for psql and the test suite. Each Postgres backend is an OS
+      # process, so this is not a free number to raise.
+      - -c
+      - max_connections=100
+      # Log any statement slower than 200ms. This is how you FIND the N+1
+      # query you did not know you had, rather than guessing.
+      - -c
+      - log_min_duration_statement=200
+      # Log every lock wait longer than 1s, which makes pessimistic-locking
+      # contention visible in the logs instead of invisible in your latency.
+      - -c
+      - log_lock_waits=on
+      - -c
+      - deadlock_timeout=1s
+    healthcheck:
+      # pg_isready is the correct check: it verifies the server ACCEPTS
+      # CONNECTIONS, which is what dependents actually need. A TCP port check
+      # would pass while the database is still replaying WAL and rejecting
+      # connections — so dependent services would start too early and crash.
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 3s
+      # 10 retries x 5s = 50s of grace. First-time initdb can genuinely take
+      # 20-30 seconds on a slow disk.
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Redis — the shared cache
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ops-redis
+    ports:
+      - "6379:6379"
+    command:
+      - redis-server
+      # ==================================================================
+      # THE EVICTION POLICY — this is the "cache eviction strategy"
+      # requirement, configured where it actually belongs.
+      #
+      # maxmemory 256mb: a HARD CEILING. Without it, Redis grows until the
+      # kernel OOM-killer takes it, which takes your cache down abruptly
+      # instead of gracefully.
+      #
+      # allkeys-lru: when full, evict the Least Recently Used key, from the
+      # WHOLE keyspace. The alternatives and why we did not choose them:
+      #
+      #   noeviction      -> writes start FAILING once full. For a cache that
+      #                      is the wrong answer: we would rather lose a cold
+      #                      entry than reject a new one.
+      #   volatile-lru    -> only evicts keys that have a TTL. We do set TTLs
+      #                      everywhere, so this would mostly work — but if
+      #                      one key were ever written without a TTL it would
+      #                      become immortal and could fill the instance.
+      #                      allkeys-* is the safer default.
+      #   allkeys-lfu     -> evicts the Least Frequently Used. Better for a
+      #                      stable hot set, but it remembers history too
+      #                      well: yesterday's viral order stays resident.
+      #   allkeys-random  -> no bookkeeping at all. Surprisingly fine at huge
+      #                      scale; worse than LRU for our access pattern,
+      #                      which has strong temporal locality (people
+      #                      re-check the order they just placed).
+      # ==================================================================
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      # Persistence OFF. A cache must be safe to lose — if we relied on Redis
+      # surviving a restart, it would be a database, and we would have to treat
+      # it with a database's care. Disabling AOF/RDB also removes fork-related
+      # latency spikes.
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Order service — the system of record for orders
+  # ---------------------------------------------------------------------------
+  order:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.services
+      args:
+        SERVICE: orderd
+    container_name: ops-order
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: dev
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: info
+      # Text logs in the demo so the output is readable as you watch it; set
+      # LOG_FORMAT=json in production, where a machine reads them.
+      LOG_FORMAT: text
+
+      # Note the hostnames: inside the compose network a service is reachable
+      # by its service NAME. "localhost" would be the container itself.
+      POSTGRES_ENABLED: "true"
+      POSTGRES_DSN: "postgres://orders:orders@postgres:5432/orders?sslmode=disable"
+      POSTGRES_MAX_CONNS: "10"
+
+      REDIS_ENABLED: "true"
+      REDIS_ADDR: "redis:6379"
+
+      CACHE_ENABLED: "true"
+      CACHE_TTL: "5m"
+      CACHE_NEGATIVE_TTL: "30s"
+
+      # The headline locking knob. Change it and restart to compare behaviour:
+      #   optimistic | pessimistic | hybrid
+      LOCK_STRATEGY: "hybrid"
+      LOCK_MAX_RETRIES: "3"
+
+      SAGA_ENABLED: "true"
+      SAGA_STEP_TIMEOUT: "5s"
+      INVENTORY_URL: "http://inventory:8081"
+      PAYMENT_URL: "http://payment:8082"
+      LEGACY_URL: "http://legacy:8083"
+
+      # Strangler Fig phase 3: the new system is authoritative, legacy answers
+      # for history, and read traffic backfills. See docs/STRANGLER_FIG.md.
+      STRANGLER_ENABLED: "true"
+      STRANGLER_WRITE_MODE: "new"
+      STRANGLER_READ_FALLBACK: "true"
+      STRANGLER_BACKFILL_ON_READ: "true"
+
+      WORKERS_ENABLED: "true"
+      # Deliberately FASTER THAN PRODUCTION so the background job is
+      # observable during a demo instead of requiring a five-minute wait.
+      WORKER_AUTO_ADVANCE_INTERVAL: "15s"
+      WORKER_AUTO_ADVANCE_AFTER: "1m"
+      WORKER_OUTBOX_INTERVAL: "2s"
+    depends_on:
+      # condition: service_healthy, not just service_started.
+      #
+      # WHY IT MATTERS: "started" means the container is running, which for
+      # Postgres is true long before it accepts connections. Without the
+      # health condition the order service boots, fails to connect, and
+      # crash-loops — and you spend ten minutes thinking the app is broken.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      inventory:
+        condition: service_started
+      payment:
+        condition: service_started
+    healthcheck:
+      # We probe /readyz, not /healthz: the dependents of this service care
+      # whether it can SERVE, not merely whether the process exists.
+      test: ["CMD", "/app/healthcheck", "http://localhost:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Inventory service — a saga participant (pessimistic locking)
+  # ---------------------------------------------------------------------------
+  inventory:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.services
+      args:
+        SERVICE: inventoryd
+    container_name: ops-inventory
+    ports:
+      - "8081:8081"
+    environment:
+      HTTP_ADDR: ":8081"
+      LOG_LEVEL: info
+      LOG_FORMAT: text
+      # This service keeps stock in memory, so it needs neither.
+      POSTGRES_ENABLED: "false"
+      REDIS_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:8081/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Payment service — a saga participant (idempotency keys)
+  # ---------------------------------------------------------------------------
+  payment:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.services
+      args:
+        SERVICE: paymentd
+    container_name: ops-payment
+    ports:
+      - "8082:8082"
+    environment:
+      HTTP_ADDR: ":8082"
+      LOG_LEVEL: info
+      LOG_FORMAT: text
+      POSTGRES_ENABLED: "false"
+      REDIS_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:8082/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Legacy order service — the system being strangled
+  # ---------------------------------------------------------------------------
+  legacy:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.services
+      args:
+        SERVICE: legacyd
+    container_name: ops-legacy
+    ports:
+      - "8083:8083"
+    environment:
+      HTTP_ADDR: ":8083"
+      LOG_LEVEL: info
+      LOG_FORMAT: text
+      POSTGRES_ENABLED: "false"
+      REDIS_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:8083/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Assistant service — the RAG chatbot sidecar (Python)
+  # ---------------------------------------------------------------------------
+  assistant:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.assistant
+    container_name: ops-assistant
+    ports:
+      - "8090:8090"
+    environment:
+      ASSISTANT_ADDR: "0.0.0.0:8090"
+      ORDER_SERVICE_URL: "http://order:8080"
+      LOG_LEVEL: info
+      # The LLM path is OFF by default, which keeps the whole system
+      # deterministic, offline and free. Set ASSISTANT_LLM=on and provide
+      # ANTHROPIC_API_KEY to switch to the real generator; see docs/AI_RAG.md.
+      ASSISTANT_LLM: "off"
+    depends_on:
+      # Only service_started, NOT service_healthy. The assistant answers every
+      # policy question from its own corpus with no help from the order
+      # service, so refusing to start without it would remove working
+      # functionality. It reports "degraded" on /readyz instead.
+      order:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/healthz', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  # A NAMED VOLUME, so your data survives `docker compose down`. Use
+  # `docker compose down -v` to wipe it deliberately. Losing demo data because
+  # you restarted is an avoidable annoyance.
+  postgres-data:
+    driver: local

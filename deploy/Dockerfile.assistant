@@ -1,0 +1,40 @@
+# =============================================================================
+# The assistant service (RAG chatbot sidecar).
+#
+# NOTE WHAT IS ABSENT: there is no `pip install`, no requirements.txt, and no
+# build stage. The service uses ONLY the Python standard library, so the image
+# is the base interpreter plus ~40KB of our code.
+#
+# THE BENEFITS ARE REAL: the build has no network dependency, no lockfile to
+# maintain, no transitive CVEs to patch, and a ~50MB image instead of the
+# ~1.2GB that a torch-based embedding stack would cost.
+#
+# THE COST IS ALSO REAL and documented in ai/rag/vectorizer.py: TF-IDF matches
+# words, not meaning. The upgrade path (swap two functions for model calls) is
+# the first thing described in docs/AI_RAG.md.
+# =============================================================================
+FROM python:3.12-alpine
+
+# A non-root user, for the same escalation reasons as the Go image.
+RUN addgroup -g 10001 -S app && adduser -u 10001 -S app -G app
+
+WORKDIR /app
+
+# PYTHONUNBUFFERED is REQUIRED in a container.
+#
+# WHY: Python buffers stdout when it is not a terminal, so log lines sit in a
+# buffer instead of reaching `docker logs`. During an incident your service
+# looks silent and dead when it is actually working fine. One environment
+# variable prevents an entire category of misdiagnosis.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+COPY --chown=app:app ai/ /app/
+
+USER app
+
+EXPOSE 8090
+
+# Exec form, so the interpreter is PID 1 and receives SIGTERM directly for the
+# graceful shutdown in server.py.
+ENTRYPOINT ["python3", "/app/server.py"]

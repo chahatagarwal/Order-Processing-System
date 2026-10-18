@@ -1,0 +1,987 @@
+# =============================================================================
+# OpenAPI 3.0 specification for the Order Processing System.
+#
+# WHY A HAND-WRITTEN SPEC RATHER THAN ONE GENERATED FROM CODE ANNOTATIONS:
+#
+#   A generated spec DESCRIBES whatever the code currently does, including its
+#   accidents. A hand-written spec is a CONTRACT you design on purpose, and the
+#   difference shows up in the places that matter most — the error cases, the
+#   semantics of a status code, and the explanation of *why* an endpoint
+#   behaves as it does. Those are exactly the parts a generator leaves empty.
+#
+#   The cost is real: this file can drift from the code. We mitigate it by
+#   asserting in the end-to-end tests that the documented status codes and
+#   error codes are the ones actually returned.
+#
+# Served at:  GET /openapi.yaml       (the raw document)
+#             GET /docs               (Swagger UI, rendered)
+# =============================================================================
+
+openapi: 3.0.3
+
+info:
+  title: Order Processing System API
+  version: "1.0.0"
+  description: |
+    An e-commerce order processing backend.
+
+    ## How to read this API
+
+    An order moves through a strict state machine:
+
+    ```
+    PENDING ──▶ PROCESSING ──▶ SHIPPED ──▶ DELIVERED
+       │             │
+       └──▶ CANCELLED / FAILED
+    ```
+
+    An order can only move **forwards**. Every illegal transition returns
+    `422 Unprocessable Entity` naming the states that *are* allowed, so a
+    client never has to guess.
+
+    ## Money is always in minor units
+
+    Every monetary value appears twice:
+
+    - `total_minor: 12997` — an **integer count of cents**. Exact. Use this
+      for any arithmetic.
+    - `total: "129.97"` — a formatted string, for display only.
+
+    We never send money as a JSON number, because every JSON parser turns
+    `129.97` into a float64 and the precision is lost before your code sees
+    it. For the same reason, prices on the way **in** are accepted as either
+    an integer (`unit_price_minor`) or a decimal **string** (`unit_price`).
+
+    ## Errors always have the same shape
+
+    Every error — including a 404 from an unknown route — returns:
+
+    ```json
+    {
+      "error": {
+        "code": "invalid_transition",
+        "message": "cannot change status from SHIPPED to PENDING",
+        "details": { "allowed_next": ["DELIVERED"] },
+        "request_id": "req-a1b2c3d4"
+      }
+    }
+    ```
+
+    Match on `code`, which is stable. `message` is for humans and may change.
+    Quote `request_id` to support: every log line for your request carries it.
+
+    ## Concurrency
+
+    Each order carries a `version` that increments on every change. Two kinds
+    of 409 exist and they mean different things:
+
+    - `code: "version_conflict"` — someone changed the order while you were
+      working. **Re-read and retry**; it will probably succeed.
+    - `code: "duplicate"` — a uniqueness constraint. Retrying will not help.
+
+    `version` is also returned as the `ETag`, so you can use conditional
+    requests.
+
+    ## Caching
+
+    - A **terminal** order (DELIVERED / CANCELLED / FAILED) is immutable, so it
+      is returned with `Cache-Control: private, max-age=3600`.
+    - A **live** order gets `private, no-store`, because it may change at any
+      moment.
+    - `private` is deliberate: an order contains personal data and must never
+      be stored in a shared CDN cache.
+    - `X-Cache: HIT|MISS` shows whether our server-side cache answered.
+
+  contact:
+    name: See the repository documentation
+    url: https://github.com/chahatagarwal96
+  license:
+    name: N.A.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: Orders
+    description: Creating, reading and transitioning orders.
+  - name: Reporting
+    description: Aggregate statistics.
+  - name: Operations
+    description: Health probes, metrics and migration diagnostics.
+
+paths:
+  # ---------------------------------------------------------------------------
+  /api/v1/orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Create an order
+      description: |
+        Creates an order and runs the distributed **saga**: reserve stock →
+        capture payment → confirm. On success the order is `PROCESSING`.
+
+        **The total is computed by the server** from the line items. A client
+        cannot supply a total, which is what prevents a tampered price.
+
+        **If the saga fails** (card declined, insufficient stock) the response
+        is a `4xx`, but the order row **still exists** with status `FAILED` and
+        its id is returned in the `X-Order-Id` header, so the customer has a
+        reference to quote. Any stock reserved and any payment taken are
+        released automatically by the saga's compensating actions.
+
+        Duplicate line items for the same `product_id` are **merged** into one
+        line with a combined quantity, so a double-submitted form does not
+        cause the warehouse to pick an item twice.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            examples:
+              integerPrices:
+                summary: Prices as integer minor units (preferred)
+                value:
+                  customer_id: "cust-1001"
+                  customer_email: "john.doe@example.com"
+                  customer_name: "John Doe"
+                  shipping_address: "123 Main St, New York, NY 10001"
+                  currency: "USD"
+                  items:
+                    - product_id: "SKU-HEADPHONES"
+                      product_name: "Wireless Headphones"
+                      product_sku: "WH-001"
+                      quantity: 2
+                      unit_price_minor: 4999
+              decimalStringPrices:
+                summary: Prices as decimal strings (also exact)
+                value:
+                  customer_id: "cust-1001"
+                  customer_email: "john.doe@example.com"
+                  shipping_address: "123 Main St"
+                  items:
+                    - product_id: "SKU-MOUSE"
+                      product_name: "Ergonomic Mouse"
+                      quantity: 1
+                      unit_price: "29.99"
+              forceADecline:
+                summary: Force a saga failure, to see compensation
+                description: |
+                  The demo payment service declines any amount whose cents end
+                  in **66**. 2 × 4983 = 9966, so this order is declined, the
+                  reserved stock is released, and the order becomes `FAILED`.
+                value:
+                  customer_id: "cust-demo"
+                  customer_email: "demo@example.com"
+                  shipping_address: "1 Demo Road"
+                  items:
+                    - product_id: "SKU-KEYBOARD"
+                      product_name: "Mechanical Keyboard"
+                      quantity: 2
+                      unit_price_minor: 4983
+      responses:
+        '201':
+          description: The order was created and the saga completed.
+          headers:
+            Location:
+              description: The URL of the new order.
+              schema: { type: string }
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400':
+          description: |
+            The request is invalid. Common `code` values: `no_items`,
+            `invalid_email`, `invalid_quantity`, `invalid_price`,
+            `missing_customer_id`, `conflicting_price`, `invalid_json`.
+
+            Note that an **unknown field** is rejected rather than ignored, so
+            a typo like `"quantiy"` is a 400 instead of silently becoming a
+            quantity of zero.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                negativeQuantity:
+                  value:
+                    error:
+                      code: "invalid_quantity"
+                      message: "quantity must be a positive whole number"
+                      details: { field: "items[0].quantity" }
+                      request_id: "req-a1b2c3d4"
+        '422':
+          description: |
+            The request was well-formed but the order could not be completed.
+            `code` is `payment_declined` or `insufficient_stock`. The saga has
+            already released any stock and refunded any charge.
+          headers:
+            X-Order-Id:
+              description: The id of the FAILED order, for customer reference.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: A required downstream service is unavailable. Safe to retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: List orders
+      description: |
+        Returns a page of orders, newest first by default.
+
+        **On pagination:** `limit`/`offset` is offered because it is what an
+        admin table needs. Be aware that a large `offset` gets linearly slower,
+        because the database must scan and discard those rows. `limit` is
+        **capped at 100** rather than rejected, so a mistaken `?limit=99999`
+        still returns a usable page.
+      parameters:
+        - name: status
+          in: query
+          description: Filter by status. Case-insensitive.
+          schema: { $ref: '#/components/schemas/OrderStatus' }
+        - name: customer_id
+          in: query
+          schema: { type: string }
+        - name: created_after
+          in: query
+          description: RFC-3339 timestamp, e.g. `2026-01-15T10:00:00Z`.
+          schema: { type: string, format: date-time }
+        - name: created_before
+          in: query
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          description: Page size. Default 20, capped at 100.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: page
+          in: query
+          description: An alternative to `offset`; `offset = page * limit`.
+          schema: { type: integer, minimum: 0 }
+        - name: size
+          in: query
+          description: An alias for `limit`.
+          schema: { type: integer, minimum: 1, maximum: 100 }
+        - name: sort_by
+          in: query
+          description: |
+            One of `created_at`, `updated_at`, `total_amount`, `status`.
+            Anything else falls back to `created_at`. The value is matched
+            against an allow-list, never interpolated into SQL.
+          schema:
+            type: string
+            enum: [created_at, updated_at, total_amount, status]
+            default: created_at
+        - name: sort_dir
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+      responses:
+        '200':
+          description: A page of orders. `orders` is always an array, never null.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderList' }
+        '400':
+          description: |
+            An invalid filter. An unrecognised `status` is rejected (rather
+            than ignored) because silently dropping a filter would return data
+            the caller did not ask for. The error lists the valid values.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------------------
+  /api/v1/orders/{id}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Get an order by its internal id
+      description: |
+        Returns one order.
+
+        **Strangler Fig note:** if the order is not in the current system, the
+        request falls back to the legacy order service and the result is
+        translated into this API's format. `X-Served-By` tells you which
+        backend answered, and `source` on the body records where the record
+        originated.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: The order.
+          headers:
+            ETag:
+              description: The order's `version`, for conditional requests.
+              schema: { type: string }
+            Cache-Control:
+              description: |
+                `private, max-age=3600` for a terminal order (it can never
+                change); `private, no-store` otherwise.
+              schema: { type: string }
+            X-Cache:
+              description: '`HIT` or `MISS` — whether our cache answered.'
+              schema: { type: string, enum: [HIT, MISS, BYPASS] }
+            X-Served-By:
+              description: '`new` or `legacy` — which backend answered.'
+              schema: { type: string, enum: [new, legacy] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404':
+          description: No such order in either the new or the legacy system.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The legacy system was needed but is unavailable. Note this is
+            **not** a 404: telling a customer their real order does not exist
+            because a backend is down would be worse than asking them to retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/orders/number/{number}:
+    get:
+      tags: [Orders]
+      operationId: getOrderByNumber
+      summary: Get an order by its customer-facing number
+      description: |
+        Looks an order up by the reference printed on the customer's receipt,
+        e.g. `ORD-7K2M9QX4`. Historical orders may use the legacy format
+        `LEG-2019-0001`, and both are supported.
+
+        Prefer this endpoint in any customer-facing flow: it is the identifier
+        the customer actually has.
+      parameters:
+        - name: number
+          in: path
+          required: true
+          description: 'Order number, e.g. `ORD-7K2M9QX4`. Case-insensitive.'
+          schema: { type: string }
+      responses:
+        '200':
+          description: The order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404':
+          description: No order with that number.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------------------
+  /api/v1/orders/{id}/status:
+    patch:
+      tags: [Orders]
+      operationId: updateOrderStatus
+      summary: Change an order's status
+      description: |
+        Moves the order to a new status, if the state machine allows it.
+
+        **PATCH, not PUT**, because this changes one field rather than
+        replacing the resource.
+
+        **Setting the status it already has is a successful no-op**, not a
+        conflict. That makes the endpoint safe to retry after a timeout —
+        otherwise every network blip would become a support ticket.
+
+        **Locking:** the server uses a hybrid strategy. It first attempts an
+        optimistic compare-and-swap; if it keeps losing to concurrent writers
+        it escalates to a database row lock so the request completes rather
+        than failing. You do not need to do anything, but under heavy
+        contention on a single order you may see a `409 version_conflict`,
+        which is safe to retry.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  $ref: '#/components/schemas/OrderStatus'
+                reason:
+                  type: string
+                  maxLength: 500
+                  description: Appended to the order's notes as an audit trail.
+            examples:
+              ship:
+                value: { status: "SHIPPED", reason: "handed to carrier DPD-99123" }
+      responses:
+        '200':
+          description: The updated order, with an incremented `version`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400':
+          description: '`missing_status`, or a status value we do not recognise.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: No such order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `version_conflict` — another request changed the order while this
+            one was in flight, and the server exhausted its retry budget.
+            **Re-read the order and retry.**
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            The transition is not permitted. `details.allowed_next` lists the
+            states you *can* move to from here.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                backwards:
+                  value:
+                    error:
+                      code: "invalid_transition"
+                      message: "cannot change status from SHIPPED to PENDING"
+                      details:
+                        current_status: "SHIPPED"
+                        requested_status: "PENDING"
+                        allowed_next: ["DELIVERED"]
+
+  # ---------------------------------------------------------------------------
+  /api/v1/orders/{id}/cancel:
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel an order
+      description: |
+        Cancels an order **if it is still PENDING**. Any payment captured is
+        refunded and any reserved stock is released, both automatically.
+
+        **POST, not DELETE**, because the order is not deleted. The record
+        survives for accounting, audit and support; only its status changes.
+
+        **Idempotent:** cancelling an already-cancelled order returns `200`
+        with no further side effects, so a double-click cannot cause two
+        refunds. Internally this endpoint always takes a database row lock,
+        precisely because it is a check-then-act with irreversible side
+        effects.
+
+        The body is optional.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+            examples:
+              withReason:
+                value: { reason: "ordered the wrong size" }
+      responses:
+        '200':
+          description: The order is cancelled (or was already cancelled).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404':
+          description: No such order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `cannot_cancel` — the order has moved past `PENDING`, so stock is
+            reserved and payment captured. Contact support, who can often
+            still stop it before dispatch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------------------
+  /api/v1/orders/stats:
+    get:
+      tags: [Reporting]
+      operationId: getOrderStats
+      summary: Aggregate order statistics
+      description: |
+        Counts by status, total revenue and the average order value.
+
+        **Revenue excludes CANCELLED and FAILED orders**, because counting
+        money that was never collected (or was refunded) would overstate it.
+        The response says so in its `note` field, so the number cannot be
+        misread.
+
+        This is the most expensive query in the API and the most tolerant of
+        staleness, so it has the longest cache TTL.
+      responses:
+        '200':
+          description: The statistics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stats' }
+
+  # ---------------------------------------------------------------------------
+  /api/v1/admin/strangler:
+    get:
+      tags: [Operations]
+      operationId: getStranglerStatus
+      summary: Strangler Fig migration progress
+      description: |
+        Reports how much traffic is still being served by the legacy system.
+
+        `legacy_share` is the number that answers **"can we decommission the
+        old system yet?"**. When it reaches 0 and stays there across a full
+        business cycle — including month-end and any annual reporting job — it
+        is safe to turn the legacy service off.
+      responses:
+        '200':
+          description: Migration status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  phase:
+                    type: string
+                    example: "phase 3: new system authoritative, legacy read-fallback for history"
+                  write_mode: { type: string, enum: [new, dual, legacy] }
+                  read_fallback_enabled: { type: boolean }
+                  backfill_enabled: { type: boolean }
+                  served_by_new: { type: integer }
+                  served_by_legacy: { type: integer }
+                  legacy_share:
+                    type: number
+                    description: 0.0 means nothing reaches legacy any more.
+                  orders_backfilled:
+                    type: integer
+                    description: Orders migrated into the new store by read traffic.
+
+  /api/v1/admin/sagas/{orderID}:
+    get:
+      tags: [Operations]
+      operationId: getSagaState
+      summary: Inspect an order's saga
+      description: |
+        Shows which saga steps completed and, for a failed order, exactly where
+        it stopped. "Which step did it die on?" is the first question anyone
+        asks about a stuck order, and this answers it without reading logs.
+      parameters:
+        - name: orderID
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The saga instances recorded for this order.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order_id: { type: string }
+                  sagas:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        ID: { type: string }
+                        Status:
+                          type: string
+                          enum: [RUNNING, COMPLETED, COMPENSATING, COMPENSATED, COMPENSATION_FAILED]
+                          description: |
+                            `COMPENSATION_FAILED` means we could not undo our
+                            own partial work and a human must reconcile it.
+                        Completed:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              Name: { type: string }
+                              Handle:
+                                type: string
+                                description: The reservation or payment id, needed to compensate.
+                        LastError: { type: string }
+
+  # ---------------------------------------------------------------------------
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: healthz
+      summary: Liveness probe
+      description: |
+        **"Is this process alive?"** Always returns 200 if the process can
+        serve a request. It deliberately does **not** check the database.
+
+        Why: Kubernetes *restarts* a pod that fails liveness. If this endpoint
+        checked Postgres, a brief database blip would make every replica fail
+        at once and Kubernetes would kill them all — turning a 30-second
+        database hiccup into a full outage caused by the health check itself.
+
+        Use `/readyz` to decide whether to send traffic.
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "alive" }
+                  service: { type: string }
+                  uptime_seconds: { type: number }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readyz
+      summary: Readiness probe
+      description: |
+        **"Can this instance serve a real request right now?"** This one does
+        check dependencies, because failing it only removes the instance from
+        the load balancer — the process keeps running and rejoins when its
+        dependencies recover.
+
+        - `200` + `status: "ok"` — everything healthy.
+        - `200` + `status: "degraded"` — a **non-critical** dependency (the
+          cache) is down. We stay in rotation on purpose: a cache outage should
+          make us slower, not absent.
+        - `503` + `status: "unavailable"` — a **critical** dependency (the
+          database) is down, or we are still starting up.
+      responses:
+        '200':
+          description: Ready, possibly degraded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+        '503':
+          description: Not ready. Do not send traffic.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Metrics in the Prometheus text exposition format.
+
+        Notable series:
+
+        | Metric | What it tells you |
+        |---|---|
+        | `http_request_duration_seconds` | Latency histogram — use it for p99, not an average |
+        | `cache_hit_ratio` | Below ~0.8 on a read-heavy workload suggests the TTL is too short |
+        | `order_lock_escalations_total` | How often hybrid locking escalated to a row lock, i.e. real contention |
+        | `order_version_conflicts_total` | Optimistic conflicts — a rising rate means a hot order |
+        | `saga_compensation_failed_total` | **Alert on this.** A customer may be charged for nothing |
+        | `outbox_published_total` | Event publishing throughput |
+        | `strangler_requests_total{backend="legacy"}` | Traffic still hitting the old system |
+      responses:
+        '200':
+          description: Metrics in Prometheus text format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  parameters:
+    OrderId:
+      name: id
+      in: path
+      required: true
+      description: The order's internal UUID.
+      schema: { type: string, format: uuid }
+
+  headers:
+    XRequestId:
+      description: |
+        A correlation id for this request. Send your own and we will use it,
+        so one id traces a single customer action across every service's logs.
+      schema: { type: string }
+
+  schemas:
+    OrderStatus:
+      type: string
+      enum: [PENDING, PROCESSING, SHIPPED, DELIVERED, CANCELLED, FAILED]
+      description: |
+        | Status | Meaning | Customer can cancel? |
+        |---|---|---|
+        | `PENDING` | Accepted, not yet picked | **Yes** |
+        | `PROCESSING` | Stock reserved, payment captured, being picked | No |
+        | `SHIPPED` | With the carrier | No |
+        | `DELIVERED` | Delivered. Final | No |
+        | `CANCELLED` | Cancelled and refunded. Final | n/a |
+        | `FAILED` | The saga could not complete; nothing charged. Final | n/a |
+
+    CreateOrderRequest:
+      type: object
+      required: [customer_id, customer_email, shipping_address, items]
+      description: |
+        Note what this object **cannot** express: `id`, `status`, `version` and
+        `total`. The server owns all of those, so a crafted request cannot set
+        them. The schema is the security control.
+      properties:
+        customer_id:
+          type: string
+          minLength: 1
+          example: "cust-1001"
+        customer_email:
+          type: string
+          format: email
+          description: Validated with an RFC-5322 parser, not a regex.
+          example: "john.doe@example.com"
+        customer_name:
+          type: string
+          maxLength: 200
+        shipping_address:
+          type: string
+          minLength: 1
+          maxLength: 500
+        notes:
+          type: string
+          maxLength: 1000
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          default: "USD"
+          description: |
+            ISO-4217. Note that the number of decimal places depends on the
+            currency: USD has 2, JPY has 0, BHD has 3.
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: '#/components/schemas/CreateOrderItem' }
+
+    CreateOrderItem:
+      type: object
+      required: [product_id, product_name, quantity]
+      description: |
+        Supply the price as **either** `unit_price_minor` (an integer) **or**
+        `unit_price` (a decimal string). Sending both with different values is
+        a `400`, because guessing which one you meant could charge the wrong
+        amount.
+      properties:
+        product_id: { type: string, minLength: 1, example: "SKU-HEADPHONES" }
+        product_name: { type: string, minLength: 1, example: "Wireless Headphones" }
+        product_sku: { type: string, example: "WH-001" }
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          description: |
+            Must be positive. A negative quantity would make the line total
+            negative and reduce the order total, so it is rejected.
+        unit_price_minor:
+          type: integer
+          minimum: 1
+          description: 'Price in minor units (cents). `4999` means $49.99.'
+          example: 4999
+        unit_price:
+          type: string
+          description: 'Price as an exact decimal string, e.g. `"49.99"`.'
+          example: "49.99"
+
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        order_number:
+          type: string
+          description: |
+            The customer-facing reference, e.g. `ORD-7K2M9QX4`. It uses
+            Crockford Base32, which omits I, L, O and U so it cannot be
+            mis-keyed when read aloud to support.
+          example: "ORD-7K2M9QX4"
+        customer_id: { type: string }
+        customer_email: { type: string, format: email }
+        customer_name: { type: string }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        status_description:
+          type: string
+          description: |
+            A plain-English explanation of the status. Sent from the server so
+            every client shows the same wording.
+          example: "Stock is reserved, payment is captured, and the warehouse is preparing your order."
+        is_cancellable:
+          type: boolean
+          description: |
+            Whether the **customer** may cancel right now. Computed by the
+            server so clients do not reimplement the rule and get it wrong.
+        is_final:
+          type: boolean
+          description: True if the order can never change again.
+        total_minor:
+          type: integer
+          description: The exact total in minor units. Use this for arithmetic.
+          example: 12997
+        total:
+          type: string
+          description: The same total, formatted for display.
+          example: "129.97"
+        currency: { type: string, example: "USD" }
+        items:
+          type: array
+          description: Always an array, never null.
+          items: { $ref: '#/components/schemas/OrderItem' }
+        item_count:
+          type: integer
+          description: Total **units**, not the number of lines.
+          example: 3
+        shipping_address: { type: string }
+        notes: { type: string }
+        cancel_reason: { type: string }
+        failure_reason:
+          type: string
+          description: Why a FAILED order could not be completed.
+        version:
+          type: integer
+          description: |
+            Increments on every change. Also returned as the `ETag`. Use it for
+            your own optimistic concurrency control.
+        source:
+          type: string
+          enum: [new, legacy]
+          description: |
+            Which system this record came from. `legacy` means it originated in
+            the old order system and was read through the Strangler Fig facade.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        status_changed_at:
+          type: string
+          format: date-time
+          description: |
+            Tracked separately from `updated_at`, so editing a note does not
+            reset the clock the background worker uses to decide when a
+            `PENDING` order is stale.
+
+    OrderItem:
+      type: object
+      description: |
+        `product_name` and `unit_price_minor` are **snapshots taken at purchase
+        time**, not live catalogue data. An order is a historical record of what
+        was agreed, so a later price change or rename must not rewrite it.
+      properties:
+        id: { type: string, format: uuid }
+        product_id: { type: string }
+        product_name: { type: string }
+        product_sku: { type: string }
+        quantity: { type: integer }
+        unit_price_minor: { type: integer, example: 4999 }
+        unit_price: { type: string, example: "49.99" }
+        line_total_minor: { type: integer, example: 9998 }
+        line_total: { type: string, example: "99.98" }
+
+    OrderList:
+      type: object
+      properties:
+        orders:
+          type: array
+          items: { $ref: '#/components/schemas/Order' }
+        pagination:
+          type: object
+          properties:
+            total:
+              type: integer
+              description: Total matching the filter, across all pages.
+            limit: { type: integer }
+            offset: { type: integer }
+            has_more: { type: boolean }
+            next_offset:
+              type: integer
+              nullable: true
+              description: |
+                Pre-computed so you do not have to do the arithmetic. `null` on
+                the last page, which makes "stop paging" unambiguous.
+
+    Stats:
+      type: object
+      properties:
+        total_orders: { type: integer }
+        count_by_status:
+          type: object
+          additionalProperties: { type: integer }
+          description: Every status is always present, including zeros, so charts have no gaps.
+        revenue_minor: { type: integer }
+        revenue: { type: string }
+        average_order_minor: { type: integer }
+        average_order: { type: string }
+        currency: { type: string }
+        generated_at: { type: string, format: date-time }
+        note:
+          type: string
+          example: "Revenue excludes CANCELLED and FAILED orders."
+
+    HealthReport:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, unavailable] }
+        service: { type: string }
+        version:
+          type: string
+          description: The exact build that is running — the first question in any incident.
+        uptime_seconds: { type: number }
+        checked_at: { type: string, format: date-time }
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, fail] }
+              critical:
+                type: boolean
+                description: |
+                  `true` means we cannot serve without it (the database).
+                  `false` means degraded-but-working (the cache).
+              error: { type: string }
+              took_ms: { type: number }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                A stable, machine-readable code. **Match on this**, not on the
+                message.
+              example: "invalid_transition"
+            message:
+              type: string
+              description: A human-readable sentence, safe to show a user.
+            details:
+              type: object
+              additionalProperties: true
+              description: Structured context, such as which field was wrong.
+            request_id:
+              type: string
+              description: Quote this to support; every log line carries it.

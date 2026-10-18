@@ -1,0 +1,132 @@
+# =============================================================================
+# A MULTI-STAGE Dockerfile shared by all four Go services.
+#
+# ONE FILE, FOUR SERVICES: the SERVICE build arg selects which cmd/ to build.
+# Four near-identical Dockerfiles would drift — one would get a security patch
+# and the others would not. This is DRY applied to infrastructure.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# STAGE 1: build
+# -----------------------------------------------------------------------------
+FROM golang:1.24-alpine AS builder
+
+# git is needed by `go mod download` for some module paths.
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /src
+
+# COPY THE MANIFESTS FIRST, then download, THEN copy the source.
+#
+# WHY THE ORDER MATTERS: Docker caches each layer keyed on its inputs. Source
+# code changes on every commit; go.mod rarely does. Copying go.mod alone first
+# means `go mod download` is cached and re-runs ONLY when dependencies change.
+# Copying everything at once would re-download every dependency on every
+# single build — turning a 5-second build into a 60-second one.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# SERVICE selects the binary: orderd | inventoryd | paymentd | legacyd.
+ARG SERVICE=orderd
+ARG VERSION=dev
+
+# The build flags, each earning its place:
+#
+#   CGO_ENABLED=0  -> a STATIC binary with no libc dependency, so it runs in a
+#                     scratch/alpine image. With cgo on, you get mysterious
+#                     "no such file or directory" errors when the binary
+#                     cannot find a shared library that does not exist in the
+#                     runtime image.
+#   -trimpath      -> strips local filesystem paths from the binary, so it does
+#                     not leak /Users/<name>/... and builds are reproducible.
+#   -ldflags "-s -w" -> drops the symbol table and DWARF debug info, typically
+#                     ~30% smaller. The trade-off: no symbolised stack traces
+#                     from a core dump. Go panics still print readable traces,
+#                     so this is a good deal.
+#   -X main.version -> stamps the version INTO the binary, so /readyz can
+#                     report exactly which build is running. In an incident,
+#                     "which version is live?" is the first question.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags="-s -w -X main.version=${VERSION}" \
+        -o /out/service \
+        ./cmd/${SERVICE}
+
+# A tiny healthcheck helper, built here so the runtime image needs no curl.
+#
+# WHY NOT JUST INSTALL curl: every package added to a runtime image is more
+# attack surface and more to patch. A 2MB static Go binary that does exactly
+# one HTTP GET is both smaller and safer than curl plus its dependencies.
+RUN printf '%s\n' \
+    'package main' \
+    '' \
+    'import (' \
+    '	"net/http"' \
+    '	"os"' \
+    '	"time"' \
+    ')' \
+    '' \
+    '// A minimal health probe: GET the URL, exit 0 on 2xx, 1 otherwise.' \
+    'func main() {' \
+    '	if len(os.Args) < 2 {' \
+    '		os.Exit(2)' \
+    '	}' \
+    '	client := &http.Client{Timeout: 3 * time.Second}' \
+    '	resp, err := client.Get(os.Args[1])' \
+    '	if err != nil {' \
+    '		os.Exit(1)' \
+    '	}' \
+    '	defer resp.Body.Close()' \
+    '	if resp.StatusCode < 200 || resp.StatusCode > 299 {' \
+    '		os.Exit(1)' \
+    '	}' \
+    '}' \
+    > /tmp/healthcheck.go \
+ && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/healthcheck /tmp/healthcheck.go
+
+# -----------------------------------------------------------------------------
+# STAGE 2: runtime
+# -----------------------------------------------------------------------------
+# WHY A SEPARATE STAGE: the builder image is ~800MB (compiler, module cache,
+# source). The runtime needs only the compiled binary. The final image is
+# ~15MB, which means faster pulls, faster deploys, and — most importantly —
+# NO COMPILER AND NO SOURCE CODE in production, so a container breakout finds
+# almost nothing to work with.
+FROM alpine:3.20
+
+# ca-certificates is required for outbound HTTPS (it would be needed by a real
+# payment provider). tzdata so timestamps format correctly in any timezone.
+RUN apk add --no-cache ca-certificates tzdata
+
+# RUN AS A NON-ROOT USER.
+#
+# By default a container runs as root, so a remote-code-execution bug gives an
+# attacker root inside the container — and root in a container is one
+# misconfiguration away from root on the host. A dedicated unprivileged user
+# removes that entire escalation path for one line of Dockerfile.
+RUN addgroup -g 10001 -S app && adduser -u 10001 -S app -G app
+
+WORKDIR /app
+
+COPY --from=builder /out/service /app/service
+COPY --from=builder /out/healthcheck /app/healthcheck
+
+# The OpenAPI spec and the Swagger UI handler read from docs/, relative to the
+# working directory.
+COPY --chown=app:app docs/openapi.yaml /app/docs/openapi.yaml
+
+USER app
+
+EXPOSE 8080
+
+# ENTRYPOINT with the exec form (a JSON array), NOT the shell form.
+#
+# WHY: the shell form wraps the process in /bin/sh, which does NOT forward
+# SIGTERM to its child. Docker's stop signal would be swallowed, graceful
+# shutdown would never run, and every deploy would hard-kill in-flight
+# requests after a 10-second timeout. The exec form makes our binary PID 1 and
+# it receives the signal directly — which is what makes the graceful shutdown
+# in httpx/server.go actually work.
+ENTRYPOINT ["/app/service"]

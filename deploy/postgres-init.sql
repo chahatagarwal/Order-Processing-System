@@ -1,0 +1,11 @@
+-- Runs ONCE, on first container start, via docker-entrypoint-initdb.d.
+--
+-- Its only job is to create the SEPARATE database used by the integration
+-- tests.
+--
+-- WHY A SECOND DATABASE RATHER THAN REUSING THE FIRST: the integration tests
+-- TRUNCATE every table. Pointed at the development database, a single
+-- `go test ./...` would silently delete the orders you were demonstrating with
+-- — and you would not realise until mid-demo. Isolating them makes that
+-- impossible rather than merely unlikely.
+CREATE DATABASE orders_test OWNER orders;
