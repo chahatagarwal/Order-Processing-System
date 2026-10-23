@@ -1,0 +1,329 @@
+# =============================================================================
+# OpenAPI 3.0 specification for the PAYMENT service (:8082).
+#
+# Hand-written, like docs/openapi.yaml, and for the same reason: it is a
+# contract, not a dump of the code. Source of truth for behaviour:
+# internal/payment/payment.go.
+# =============================================================================
+
+openapi: 3.0.3
+
+info:
+  title: Payment Service API
+  version: "1.0.0"
+  description: |
+    Charges and refunds for the order saga. **Money moves exactly once per
+    idempotency key.**
+
+    ## Idempotency is the whole design
+
+    If a charge succeeds but the response is lost, the caller cannot tell
+    whether money moved. The only safe fix is an idempotency key. This
+    service stores `key -> result`:
+
+    - **Same key, same request** → the **original result** is replayed. No
+      money moves. This includes declines: a declined charge stays declined
+      on retry.
+    - **Same key, different request** (a different amount, currency, order or
+      customer) → `409 idempotency_key_reuse`. That is almost always a client
+      bug, so we reject it rather than guess.
+
+    If `Idempotency-Key` is omitted, it defaults to `order:<order_id>:charge`.
+
+    ## Money is in minor units
+
+    `amount_minor` is an integer count of cents. It is never a float.
+
+    ## Forcing a decline (demo rule)
+
+    **Any amount whose cents end in `66` is declined** (e.g. `9966`). This
+    gives tests a deterministic way to make the saga fail and compensate.
+
+    State is in-memory and resets on restart.
+
+servers:
+  - url: http://localhost:8082
+    description: Local development
+
+tags:
+  - name: Payments
+    description: Charge (saga step), refund (compensation) and lookup.
+  - name: Operations
+    description: Health probes and metrics.
+
+paths:
+  /api/v1/payments:
+    post:
+      tags: [Payments]
+      operationId: chargePayment
+      summary: Charge a payment
+      description: |
+        Captures a payment. Retrying with the same `Idempotency-Key` and the
+        same body returns the original `payment_id` and charges nothing.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Strongly recommended. Defaults to `order:<order_id>:charge`.
+          schema: { type: string }
+      requestBody:
+        required: true
+        description: Max 8 KiB. Unknown fields are rejected.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChargeRequest' }
+            example:
+              order_id: "6f1c2e9a-1b2c-4d5e-8f90-123456789abc"
+              customer_id: "cust-1001"
+              customer_email: "john.doe@example.com"
+              amount_minor: 9998
+              currency: "USD"
+      responses:
+        '201':
+          description: Captured, or the original capture replayed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChargeResponse' }
+        '400':
+          description: |
+            `invalid_json` (malformed body or unknown fields) or
+            `invalid_amount` (`amount_minor` ≤ 0).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `idempotency_key_reuse`: this key was already used for a different
+            request. Use a new key for a new charge.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `payment_declined`. **Do not retry with the same key**, because it
+            will replay the decline. The saga should compensate.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: payment_declined
+                  message: "card declined: insufficient funds"
+                  request_id: req-a1b2c3d4
+
+  /api/v1/payments/{id}/refund:
+    post:
+      tags: [Payments]
+      operationId: refundPayment
+      summary: Refund a payment
+      description: |
+        The saga's compensating action for a charge.
+
+        **Always 204 when the body is valid.** Two cases look like errors but
+        are treated as success:
+
+        - **Unknown payment:** there is nothing to refund, which is already
+          the goal.
+        - **Already refunded:** nothing happens. This guard stops a retried
+          compensation from refunding the customer twice.
+
+        The body is optional.
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Accepted but not required. The double-refund guard already makes
+            this call safe to repeat.
+          schema: { type: string }
+      requestBody:
+        required: false
+        description: Max 4 KiB. Unknown fields are rejected.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  type: string
+                  description: Stored as `refund_reason` on the payment.
+                  example: "saga compensation: inventory reservation failed"
+      responses:
+        '204':
+          description: Refunded, already refunded, or nothing to refund.
+        '400':
+          description: '`invalid_json`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/payments/{id}:
+    get:
+      tags: [Payments]
+      operationId: getPayment
+      summary: Get a payment
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+      responses:
+        '200':
+          description: The payment, including refund state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '404':
+          description: '`payment_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: healthz
+      summary: Liveness probe
+      description: |
+        "Is this process alive?" Never checks dependencies.
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "alive" }
+                  service: { type: string }
+                  uptime_seconds: { type: number }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readyz
+      summary: Readiness probe
+      description: '"Can this instance serve traffic?" `503` until boot completes.'
+      responses:
+        '200':
+          description: Ready (`ok` or `degraded`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+        '503':
+          description: Not ready. Do not send traffic.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Notable series: `payment_captured_total{currency}`,
+        `payment_declined_total`, `payment_refunded_total`,
+        `payment_idempotent_replays_total`, `payment_refund_replays_total`,
+        `payment_idempotency_mismatch_total`, `payment_amount_minor`
+        (histogram). Alert on a non-zero `payment_idempotency_mismatch_total`;
+        it means a client is reusing keys.
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  parameters:
+    PaymentId:
+      name: id
+      in: path
+      required: true
+      description: |
+        A payment id (`pay-<uuid>`) or `order:<order_id>`. The second form
+        lets the cancellation path refund knowing only the order.
+      schema: { type: string }
+      examples:
+        byPayment: { value: "pay-3c9d1e2f-4a5b-6c7d-8e9f-0a1b2c3d4e5f" }
+        byOrder: { value: "order:6f1c2e9a-1b2c-4d5e-8f90-123456789abc" }
+
+  schemas:
+    ChargeRequest:
+      type: object
+      required: [order_id, customer_id, amount_minor, currency]
+      additionalProperties: false
+      properties:
+        order_id: { type: string }
+        customer_id: { type: string }
+        customer_email: { type: string, format: email }
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Integer cents. Ending in `66` forces a decline.
+        currency: { type: string, example: "USD" }
+
+    ChargeResponse:
+      type: object
+      required: [payment_id, captured]
+      properties:
+        payment_id: { type: string, example: "pay-3c9d1e2f-4a5b-6c7d-8e9f-0a1b2c3d4e5f" }
+        captured: { type: boolean, example: true }
+        reason:
+          type: string
+          description: Reserved for future use; currently never set on success.
+
+    Payment:
+      type: object
+      properties:
+        payment_id: { type: string }
+        order_id: { type: string }
+        customer_id: { type: string }
+        amount_minor: { type: integer, format: int64 }
+        currency: { type: string }
+        captured: { type: boolean }
+        refunded: { type: boolean }
+        created_at: { type: string, format: date-time }
+        refunded_at:
+          type: string
+          format: date-time
+          description: Present only once refunded.
+        refund_reason:
+          type: string
+          description: Present only once refunded with a reason.
+
+    HealthReport:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, unavailable] }
+        service: { type: string }
+        version: { type: string }
+        uptime_seconds: { type: number }
+        checked_at: { type: string, format: date-time }
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, fail] }
+              critical: { type: boolean }
+              error: { type: string }
+              took_ms: { type: number }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable, machine-readable. Match on this, not the message.
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+            request_id: { type: string }

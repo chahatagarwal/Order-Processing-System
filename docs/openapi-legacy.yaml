@@ -1,0 +1,279 @@
+# =============================================================================
+# OpenAPI 3.0 specification for the LEGACY order system (:8083).
+#
+# Hand-written, like docs/openapi.yaml. This documents the OLD contract as it
+# is, quirks included, because those quirks are what the Strangler Fig adapter
+# has to translate. Source of truth: internal/legacy/legacy.go.
+# =============================================================================
+
+openapi: 3.0.3
+
+info:
+  title: Legacy Order System API
+  version: "1.0.0"
+  description: |
+    The old order system being replaced by the order service using the
+    **Strangler Fig** pattern. Clients should use the order service (:8080).
+    That service calls this one through an adapter.
+
+    ## Quirks, kept on purpose
+
+    | Legacy | New system |
+    |---|---|
+    | `order_ref`, `cust_ref`, `lines` | `id`, `customer_id`, `items` |
+    | Money as a **dollar string**: `"1299.00"` | Integer cents |
+    | Timestamps as `"2019-04-02 09:13:44"` (not RFC 3339) | RFC 3339 |
+    | States `NEW / PICKING / DISPATCHED / COMPLETE / VOID`, plus unknown ones like `AWAIT_FAX` | The order state machine |
+    | `/legacy/...` paths | `/api/v1/...` |
+
+    ## No idempotency
+
+    `POST /legacy/orders` has **no idempotency support**, so a retried write
+    can create a duplicate. This is why the adapter never retries writes to
+    this service.
+
+    ## Slow on purpose
+
+    `GET` by reference waits for a configured delay before responding. This
+    gives the adapter's timeouts and circuit breaker something real to deal
+    with.
+
+    ## Seeded orders (exist only here)
+
+    `LEG-2019-0001` (COMPLETE), `LEG-2021-0042` (DISPATCHED) and
+    `LEG-2020-0777` (`AWAIT_FAX`, an unknown state). Use them to demo the
+    read fallback and backfill. State is in-memory and resets on restart.
+
+servers:
+  - url: http://localhost:8083
+    description: Local development
+
+tags:
+  - name: Legacy orders
+    description: The old order API.
+  - name: Operations
+    description: Health probes and metrics.
+
+paths:
+  /legacy/orders:
+    get:
+      tags: [Legacy orders]
+      operationId: listLegacyOrders
+      summary: List all orders
+      description: Returns every order. No pagination; order is **not** guaranteed.
+      responses:
+        '200':
+          description: All orders.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items: { $ref: '#/components/schemas/LegacyOrder' }
+                  count: { type: integer }
+
+    post:
+      tags: [Legacy orders]
+      operationId: createLegacyOrder
+      summary: Create (or overwrite) an order
+      description: |
+        Used when `STRANGLER_WRITE_MODE` is `legacy` or `dual`.
+
+        - **No idempotency.** Do not retry on timeout.
+        - **Upsert, not insert.** If `order_ref` already exists (case-
+          insensitive), that order is **silently replaced**. There is no
+          duplicate check.
+        - Only `order_ref` is validated. Other fields are stored as sent.
+      requestBody:
+        required: true
+        description: Max 32 KiB. Unknown fields are rejected.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LegacyOrder' }
+      responses:
+        '201':
+          description: Stored. The body is the order exactly as received.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegacyOrder' }
+        '400':
+          description: '`invalid_json` or `missing_order_ref`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /legacy/orders/{ref}:
+    get:
+      tags: [Legacy orders]
+      operationId: getLegacyOrder
+      summary: Get an order by reference
+      description: Case-insensitive. Subject to the simulated latency.
+      parameters:
+        - $ref: '#/components/parameters/OrderRef'
+      responses:
+        '200':
+          description: The order, in the legacy shape.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegacyOrder' }
+        '404':
+          description: '`legacy_order_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /legacy/orders/by-ref/{ref}:
+    get:
+      tags: [Legacy orders]
+      operationId: getLegacyOrderByRef
+      summary: Get an order by reference (alias)
+      description: Same handler as `GET /legacy/orders/{ref}`.
+      parameters:
+        - $ref: '#/components/parameters/OrderRef'
+      responses:
+        '200':
+          description: The order, in the legacy shape.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegacyOrder' }
+        '404':
+          description: '`legacy_order_not_found`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: healthz
+      summary: Liveness probe
+      description: '"Is this process alive?" Never checks dependencies.'
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "alive" }
+                  service: { type: string }
+                  uptime_seconds: { type: number }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readyz
+      summary: Readiness probe
+      description: '"Can this instance serve traffic?" `503` until boot completes.'
+      responses:
+        '200':
+          description: Ready (`ok` or `degraded`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+        '503':
+          description: Not ready. Do not send traffic.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  parameters:
+    OrderRef:
+      name: ref
+      in: path
+      required: true
+      description: Legacy order reference. Case-insensitive.
+      schema: { type: string, example: "LEG-2019-0001" }
+
+  schemas:
+    LegacyLine:
+      type: object
+      additionalProperties: false
+      properties:
+        sku: { type: string, example: "SKU-LAPTOP" }
+        desc: { type: string, example: "ThinkPad X1 (2019 model)" }
+        qty: { type: integer, example: 1 }
+        price_each:
+          type: string
+          description: Dollars as a decimal string.
+          example: "1299.00"
+
+    LegacyOrder:
+      type: object
+      required: [order_ref]
+      additionalProperties: false
+      properties:
+        order_ref: { type: string, example: "LEG-2019-0001" }
+        cust_ref: { type: string, example: "cust-legacy-1" }
+        cust_email: { type: string, example: "early.adopter@example.com" }
+        cust_name: { type: string, example: "Early Adopter" }
+        order_state:
+          type: string
+          description: |
+            Usually `NEW`, `PICKING`, `DISPATCHED`, `COMPLETE` or `VOID`, but
+            **not an enum**: unknown values such as `AWAIT_FAX` exist. The
+            adapter maps unknown values to `PENDING`.
+          example: "COMPLETE"
+        amount_dollars:
+          type: string
+          description: Order total in dollars, as a decimal string.
+          example: "1299.00"
+        ship_to: { type: string, example: "1 Old Street, London, EC1V 9HL" }
+        created:
+          type: string
+          description: '`YYYY-MM-DD HH:MM:SS`, not RFC 3339.'
+          example: "2019-04-02 09:13:44"
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/LegacyLine' }
+
+    HealthReport:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, unavailable] }
+        service: { type: string }
+        version: { type: string }
+        uptime_seconds: { type: number }
+        checked_at: { type: string, format: date-time }
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, fail] }
+              critical: { type: boolean }
+              error: { type: string }
+              took_ms: { type: number }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable, machine-readable. Match on this, not the message.
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+            request_id: { type: string }

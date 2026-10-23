@@ -1,0 +1,316 @@
+# =============================================================================
+# OpenAPI 3.0 specification for the INVENTORY service (:8081).
+#
+# Hand-written, like docs/openapi.yaml, and for the same reason: it is a
+# contract, not a dump of the code. Source of truth for behaviour:
+# internal/inventory/inventory.go.
+# =============================================================================
+
+openapi: 3.0.3
+
+info:
+  title: Inventory Service API
+  version: "1.0.0"
+  description: |
+    Reserves and releases stock for the order saga.
+
+    ## Pessimistic locking, on purpose
+
+    Stock is a shared, contended counter, so every reservation runs under a
+    lock (the in-memory stand-in for `SELECT ... FOR UPDATE`). Requests queue
+    briefly and then succeed or fail deterministically, rather than losing a
+    compare-and-swap and retrying. Stock can never go negative.
+
+    ## All-or-nothing
+
+    A reservation with several items either reserves **all** of them or
+    **none**. Every item is checked before any stock is decremented.
+
+    ## Reservations expire
+
+    An unconfirmed reservation expires after **15 minutes** and its stock
+    returns to the pool. This is the safety net for a saga that dies before it
+    can compensate.
+
+    ## Seeded stock
+
+    | Product | Units |
+    |---|---|
+    | `SKU-LAPTOP` | 50 |
+    | `SKU-HEADPHONES` | 200 |
+    | `SKU-MOUSE` | 500 |
+    | `SKU-KEYBOARD` | 120 |
+    | `SKU-MONITOR` | 30 |
+    | `SKU-LIMITED` | 2 (for contention demos) |
+    | `SKU-OUT-OF-STOCK` | 0 (forces a saga failure) |
+
+    State is in-memory and resets on restart.
+
+servers:
+  - url: http://localhost:8081
+    description: Local development
+
+tags:
+  - name: Reservations
+    description: Holding and releasing stock (saga step + compensation).
+  - name: Stock
+    description: Current stock levels.
+  - name: Operations
+    description: Health probes and metrics.
+
+paths:
+  /api/v1/reservations:
+    post:
+      tags: [Reservations]
+      operationId: reserveStock
+      summary: Reserve stock for an order
+      description: |
+        The saga's forward step. Safe to retry: a repeated idempotency key
+        returns the **original** reservation and does not decrement stock
+        again.
+
+        If `Idempotency-Key` is omitted, the key defaults to
+        `order:<order_id>`, so the endpoint is still retry-safe. The default
+        errs on the side of safety because this endpoint changes stock.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        description: Max 32 KiB. Unknown fields are rejected.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReserveRequest' }
+            example:
+              order_id: "6f1c2e9a-1b2c-4d5e-8f90-123456789abc"
+              items:
+                - { product_id: "SKU-HEADPHONES", quantity: 2 }
+                - { product_id: "SKU-MOUSE", quantity: 1 }
+      responses:
+        '201':
+          description: Stock reserved (or the original reservation replayed).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReserveResponse' }
+        '400':
+          description: |
+            `invalid_json` (malformed body or unknown fields), `no_items`, or
+            `invalid_quantity` (quantity ≤ 0; `details.product_id` names it).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `unknown_product`: this service does not carry the product.
+            `details.product_id` names it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `insufficient_stock`. **Do not retry.** The result will not change,
+            so the saga should compensate. `details` has `product_id`,
+            `requested` and `available`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: insufficient_stock
+                  message: insufficient stock for SKU-OUT-OF-STOCK
+                  details: { product_id: SKU-OUT-OF-STOCK, requested: 1, available: 0 }
+                  request_id: req-a1b2c3d4
+
+  /api/v1/reservations/{id}:
+    delete:
+      tags: [Reservations]
+      operationId: releaseReservation
+      summary: Release a reservation
+      description: |
+        The saga's compensating action. Returns the held stock to the pool.
+
+        **Releasing a reservation that does not exist is a success (204).**
+        The goal is "this reservation holds no stock", and that is already
+        true. This makes compensation idempotent: a retried release can never
+        fail or credit stock twice.
+
+        `id` can be a reservation id (`res-…`) or `order:<order_id>`. The
+        second form lets the order service release stock without having
+        stored the reservation id.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: A reservation id (`res-<uuid>`) or `order:<order_id>`.
+          schema: { type: string }
+          examples:
+            byReservation: { value: "res-0b8e5a52-7d1f-4c3a-9e2b-5f6a7b8c9d0e" }
+            byOrder: { value: "order:6f1c2e9a-1b2c-4d5e-8f90-123456789abc" }
+      responses:
+        '204':
+          description: Released, or there was nothing to release.
+
+  /api/v1/stock:
+    get:
+      tags: [Stock]
+      operationId: getStock
+      summary: Current stock levels
+      description: Available and reserved units for every product.
+      responses:
+        '200':
+          description: Stock levels keyed by product id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StockResponse' }
+              example:
+                stock:
+                  SKU-HEADPHONES: { available: 198, reserved: 2 }
+                  SKU-OUT-OF-STOCK: { available: 0, reserved: 0 }
+
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: healthz
+      summary: Liveness probe
+      description: |
+        "Is this process alive?" Never checks dependencies; a failing
+        liveness probe restarts the pod, so it must only fail if the process
+        itself is broken.
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: "alive" }
+                  service: { type: string }
+                  uptime_seconds: { type: number }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readyz
+      summary: Readiness probe
+      description: |
+        "Can this instance serve traffic?" `503` until boot completes.
+      responses:
+        '200':
+          description: Ready (`ok` or `degraded`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+        '503':
+          description: Not ready. Do not send traffic.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Notable series: `inventory_reserved_total`, `inventory_released_total`,
+        `inventory_insufficient_total{product_id}`,
+        `inventory_idempotent_replays_total`, `inventory_expired_total`.
+        A rising `inventory_expired_total` means sagas are dying before they
+        compensate.
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Makes the request safe to retry. Defaults to `order:<order_id>`.
+      schema: { type: string }
+
+  schemas:
+    ReservedItem:
+      type: object
+      required: [product_id, quantity]
+      properties:
+        product_id: { type: string, example: "SKU-HEADPHONES" }
+        quantity: { type: integer, minimum: 1, example: 2 }
+
+    ReserveRequest:
+      type: object
+      required: [order_id, items]
+      additionalProperties: false
+      properties:
+        order_id: { type: string }
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/ReservedItem' }
+
+    ReserveResponse:
+      type: object
+      required: [reservation_id, reserved]
+      properties:
+        reservation_id: { type: string, example: "res-0b8e5a52-7d1f-4c3a-9e2b-5f6a7b8c9d0e" }
+        reserved: { type: boolean, example: true }
+        expires_at:
+          type: string
+          format: date-time
+          description: When the reservation expires if it is never confirmed (RFC 3339).
+        reason:
+          type: string
+          description: Reserved for future use; currently never set on success.
+
+    StockLevel:
+      type: object
+      properties:
+        available: { type: integer, description: Units on hand and not reserved. }
+        reserved: { type: integer, description: Units currently held by reservations. }
+
+    StockResponse:
+      type: object
+      properties:
+        stock:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/StockLevel' }
+
+    HealthReport:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, unavailable] }
+        service: { type: string }
+        version: { type: string }
+        uptime_seconds: { type: number }
+        checked_at: { type: string, format: date-time }
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, fail] }
+              critical: { type: boolean }
+              error: { type: string }
+              took_ms: { type: number }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable, machine-readable. Match on this, not the message.
+            message: { type: string }
+            details:
+              type: object
+              additionalProperties: true
+            request_id: { type: string }
